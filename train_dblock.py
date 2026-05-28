@@ -222,12 +222,14 @@ while True:
         print(f"step {iter_num}: "
               f"train loss {losses['train']:.4f} (ce {losses['train_ce']:.4f}), "
               f"val loss {losses['val']:.4f} (ce {losses['val_ce']:.4f})")
+        peak_mb = torch.cuda.max_memory_allocated() / 1024**2 if device_type == 'cuda' else 0
         loss_log.append({
-            'iter':     iter_num,
-            'train':    losses['train'].item(),
-            'val':      losses['val'].item(),
-            'train_ce': losses['train_ce'].item(),
-            'val_ce':   losses['val_ce'].item(),
+            'iter':         iter_num,
+            'train':        losses['train'].item(),
+            'val':          losses['val'].item(),
+            'train_ce':     losses['train_ce'].item(),
+            'val_ce':       losses['val_ce'].item(),
+            'peak_vram_mb': peak_mb,
         })
         if wandb_log:
             wandb.log({

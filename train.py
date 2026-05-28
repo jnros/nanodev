@@ -269,7 +269,8 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        loss_log.append({'iter': iter_num, 'train': losses['train'].item(), 'val': losses['val'].item()})
+        peak_mb = torch.cuda.max_memory_allocated() / 1024**2 if device_type == 'cuda' else 0
+        loss_log.append({'iter': iter_num, 'train': losses['train'].item(), 'val': losses['val'].item(), 'val_ce': losses['val'].item(), 'peak_vram_mb': peak_mb})
         if wandb_log:
             wandb.log({
                 "iter": iter_num,

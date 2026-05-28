@@ -20,6 +20,7 @@ import os
 import time
 import math
 import pickle
+import json
 from contextlib import nullcontext
 
 import numpy as np
@@ -207,6 +208,10 @@ if compile:
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
 
+# reset peak VRAM counter after model init/compile
+if device_type == 'cuda':
+    torch.cuda.reset_peak_memory_stats()
+
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -252,6 +257,7 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+loss_log = [] # list of {iter, train, val}
 while True:
 
     # determine and set the learning rate for this iteration
@@ -263,6 +269,7 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        loss_log.append({'iter': iter_num, 'train': losses['train'].item(), 'val': losses['val'].item()})
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -334,3 +341,24 @@ while True:
 
 if ddp:
     destroy_process_group()
+
+if master_process:
+    peak_vram_mb = (torch.cuda.max_memory_allocated() / 1024**2) if device_type == 'cuda' else 0
+    summary = {
+        'scenario': 'baseline',
+        'dataset': dataset,
+        'n_layer': n_layer,
+        'n_head': n_head,
+        'n_embd': n_embd,
+        'block_size': block_size,
+        'batch_size': batch_size,
+        'max_iters': max_iters,
+        'lr_decay_iters': lr_decay_iters,
+        'peak_vram_mb': peak_vram_mb,
+    }
+    with open(os.path.join(out_dir, 'baseline_summary.json'), 'w') as f:
+        json.dump(summary, f, indent=2)
+    with open(os.path.join(out_dir, 'loss_curves.json'), 'w') as f:
+        json.dump(loss_log, f, indent=2)
+    print(f"peak VRAM: {peak_vram_mb:.1f} MB")
+    print(f"saved loss_curves.json and baseline_summary.json to {out_dir}")

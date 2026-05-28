@@ -26,8 +26,8 @@ dropout = 0.2
 num_dblocks = 3
 
 learning_rate = 1e-3
-max_iters = 15000
-lr_decay_iters = 15000
+max_iters = 30000
+lr_decay_iters = 30000
 min_lr = 1e-4
 beta2 = 0.99
 

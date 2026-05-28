@@ -155,7 +155,8 @@ class GPTDBlock(GPT):
 		return int(vals[counts.argmax()].item())
 
 	def _edm_weights(self, sigma: torch.Tensor) -> torch.Tensor:
-		return (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data)**2
+		w = (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data)**2
+		return w / w.mean()
 
 	# --- forward ---
 

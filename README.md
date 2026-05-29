@@ -8,7 +8,7 @@ Each block gets its own freshly-drawn noise sample at its assigned σ — not th
 
 The published Sakana repo implements only image classification; the AR language-model results in the paper aren't open-sourced. So I cloned Karpathy's nanoGPT (he's my sensei) and added diffusion where it don't belong.
 
-![loss curves](loss_curves_overlay.png)
+![summary]('summary.png')
 
 6-layer causal GPT, Shakespeare-char, A100 rented at $0.89/hr.
 
@@ -32,3 +32,5 @@ Everything else is unmodified Karpathy.
 Limitations: Not frontier scale. The paper's largest AR result is 12 layers on OpenWebText with mixed metrics. Whether the gap closes or widens with depth, fine-tuning works on pretrained models, and the parallel-across-interconnect claim holds at realistic latencies — those are open. All testable.
 
 If those open questions resolve favorably, the entire concentration story behind the current AI buildout bends. That's a big if. It's also a smaller if than it was 48 hours ago — and now it's something anyone can poke at on a rented GPU.
+
+![loss curves](loss_curves_overlay.png)

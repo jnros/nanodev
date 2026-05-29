@@ -6,6 +6,8 @@ Causal autoregressive language model. EDM preconditioning, σ sampled from the e
 
 Each block gets its own freshly-drawn noise sample at its assigned σ — not the output of the block before it. Each block has its own local denoising objective. No backward gradient flows between blocks. The model stops being one monolithic object and becomes a set of independently-trainable specialists for the same final answer.
 
+![`summary.png`](summary.png)
+
 The published Sakana repo implements only image classification; the AR language-model results in the paper aren't open-sourced. So I cloned Karpathy's nanoGPT (he's my sensei) and added diffusion where it don't belong.
 
 6-layer causal GPT, Shakespeare-char, A100 rented at $0.89/hr.

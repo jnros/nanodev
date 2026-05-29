@@ -30,6 +30,8 @@ def _norm_ppf(p: float) -> float:
 def get_block_sigmas(num_blocks: int, sigma_min: float = 0.002,
                      sigma_max: float = 80.0, p_mean: float = -1.2,
                      p_std: float = 1.2) -> list:
+	# DBLOCK 1/6: partition log-normal σ distribution into B equal-probability
+	# bands. each block owns one band; high σ = coarse, low σ = fine detail.
 	"""Equi-probability σ partition boundaries; length = num_blocks + 1."""
 	cdf_lo = _norm_cdf((math.log(sigma_min) - p_mean) / p_std)
 	cdf_hi = _norm_cdf((math.log(sigma_max) - p_mean) / p_std)
@@ -45,6 +47,8 @@ def get_block_sigmas(num_blocks: int, sigma_min: float = 0.002,
 # ---------------------------------------------------------------------------
 
 class AdaLayerNorm(nn.Module):
+	# DBLOCK 2/6: noise-conditioned layer norm. injects c_noise (= 0.25·log σ)
+	# as a per-sample scale+shift so each layer knows its noise level.
 	"""LayerNorm + per-sample affine modulation from scalar c_noise."""
 
 	def __init__(self, n_embd: int, bias: bool):
@@ -108,7 +112,7 @@ class GPTDBlock(GPT):
 		self.num_dblocks = num_dblocks
 		self.sigma_data  = sigma_data
 
-		# replace standard Blocks with DBlocks
+		# DBLOCK 3/6: swap every standard Block for a DBlock (AdaLN variant).
 		self.transformer.h = nn.ModuleList(
 			[DBlock(config) for _ in range(config.n_layer)]
 		)
@@ -165,6 +169,7 @@ class GPTDBlock(GPT):
 		b, t   = idx.size()
 		assert t <= self.config.block_size
 
+		# DBLOCK 4/6: sample σ from one block's CDF band (random block each step).
 		sigma   = self._sample_sigmas(b, device)
 		s2      = sigma ** 2
 		sd2     = self.sigma_data ** 2
@@ -174,12 +179,15 @@ class GPTDBlock(GPT):
 		c_noise = 0.25 * sigma.log()
 
 		z   = self.transformer.wte(idx)
+		# DBLOCK 5/6: noise all token embeddings with the sampled σ.
 		zt  = z + sigma[:, None, None] * torch.randn_like(z)
 
 		pos = torch.arange(t, device=device)
 		x   = self.transformer.drop(
 		        zt * c_in[:, None, None] + self.transformer.wpe(pos))
 
+		# DBLOCK 6/6: run only the assigned block's layers — no gradient flows
+		# to other blocks. this is the whole mechanism.
 		blk = self._target_block(sigma)
 		for i in self.layer_assignment[blk]:
 			x = self.transformer.h[i](x, c_noise)

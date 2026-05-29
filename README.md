@@ -18,6 +18,15 @@ The published Sakana repo implements only image classification; the AR language-
 
 **Ablation:** hypothesized the gap was an EDM weighting artifact (low-σ blocks dominating gradients). Ran a normalized-weight ablation. Negative result. The gap is structural at this scale, not a weighting bug. Total compute cost <$10.
 
+## Code
+
+Two files hold all the changes from nanoGPT:
+
+- [`model_dblock.py`](model_dblock.py) — 205 lines. Imports the original `model.py` and adds the diffusion logic on top. The whole file is the delta. Six `DBLOCK n/6` markers walk you through the key moves in order.
+- [`train_dblock.py`](train_dblock.py) — 318 lines. Training loop adapted for the diffusion objective: EDM-weighted loss, σ curriculum, dual logging of EDM loss and val CE.
+
+Everything else is unmodified Karpathy.
+
 ---
 
 Limitations: Not frontier scale. The paper's largest AR result is 12 layers on OpenWebText with mixed metrics. Whether the gap closes or widens with depth, fine-tuning works on pretrained models, and the parallel-across-interconnect claim holds at realistic latencies — those are open. All testable.

@@ -8,8 +8,6 @@ Each block gets its own freshly-drawn noise sample at its assigned σ — not th
 
 The published Sakana repo implements only image classification; the AR language-model results in the paper aren't open-sourced. So I cloned Karpathy's nanoGPT (he's my sensei) and added diffusion where it don't belong.
 
-![summary]('summary.png')
-
 6-layer causal GPT, Shakespeare-char, A100 rented at $0.89/hr.
 
 **Peak VRAM:** 1628 → 758 MB (2.16× reduction) — and this is the small version of the win. Reduction here is because only 2 of 6 layers run per step on a single GPU. The bigger structural win is that those 2 layers don't need the other 4 present at all — they could be on a different machine, trained by a different team.

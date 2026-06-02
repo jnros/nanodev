@@ -4,7 +4,7 @@
 # Run from repo root. Adjust PYTHON if needed.
 set -euo pipefail
 
-PYTHON="uv run python"
+PYTHON="python"
 BASE_ITERS=30000
 
 declare -A DEPTHS=(

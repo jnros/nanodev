@@ -140,9 +140,13 @@ def _make_block_sampler(m, blk_idx):
 	pm, ps = -1.2, 1.2
 	c_lo = _norm_cdf((math.log(s_lo) - pm) / ps)
 	c_hi = _norm_cdf((math.log(s_hi) - pm) / ps)
+	# rank-local generator: σ samples independent across ranks.
+	# data loading keeps the shared global RNG for controlled batch comparison.
+	_gen = torch.Generator()
+	_gen.manual_seed(1337 + blk_idx)
 
 	def _sample(self, n, dev):
-		u = torch.rand(n)
+		u = torch.rand(n, generator=_gen)
 		p = c_lo + (c_hi - c_lo) * u
 		ppf = math.sqrt(2.0) * torch.erfinv(2.0 * p - 1.0)
 		sigma = torch.exp(torch.tensor(pm, dtype=torch.float32)

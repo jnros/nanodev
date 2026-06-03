@@ -265,7 +265,7 @@ while True:
 			}
 			loss_log.append(entry)
 			if losses['val'] < best_val_loss:
-				best_val_loss = losses['val']
+				best_val_loss = losses['val'].item()
 				best_val_ce   = losses['val_ce'].item()
 
 	if iter_num == 0 and eval_only:

@@ -235,9 +235,10 @@ def get_lr(it):
 
 def _sigma_diagnostic(n=100):
 	"""Sample n σ values, gather to rank 0, print ranges and inter-rank correlation."""
-	sigma = model._sample_sigmas(n, 'cpu')
-	gathered = [torch.zeros(n) for _ in range(world_size)]
+	sigma = model._sample_sigmas(n, device)
+	gathered = [torch.zeros(n, device=device) for _ in range(world_size)]
 	dist.all_gather(gathered, sigma)
+	gathered = [s.cpu() for s in gathered]
 	if not master:
 		return
 	bs = model.block_sigmas

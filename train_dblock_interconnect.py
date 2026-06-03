@@ -143,7 +143,7 @@ def _make_block_sampler(m, blk_idx):
 	# rank-local generator: σ samples independent across ranks.
 	# data loading keeps the shared global RNG for controlled batch comparison.
 	_gen = torch.Generator()
-	_gen.manual_seed(1337 + blk_idx)
+	_gen.manual_seed(1337 + blk_idx * 10007)  # wide spacing; hash() avoided (PYTHONHASHSEED)
 
 	def _sample(self, n, dev):
 		u = torch.rand(n, generator=_gen)
@@ -228,6 +228,44 @@ def get_lr(it):
 	ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
 	coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
 	return min_lr + coeff * (learning_rate - min_lr)
+
+# ---------------------------------------------------------------------------
+# σ diagnostic: verify disjoint ranges and independent sampling across ranks
+# ---------------------------------------------------------------------------
+
+def _sigma_diagnostic(n=100):
+	"""Sample n σ values, gather to rank 0, print ranges and inter-rank correlation."""
+	sigma = model._sample_sigmas(n, 'cpu')
+	gathered = [torch.zeros(n) for _ in range(world_size)]
+	dist.all_gather(gathered, sigma)
+	if not master:
+		return
+	bs = model.block_sigmas
+	lines = ["--- σ diagnostic ---"]
+	for r, s in enumerate(gathered):
+		ri = model.num_dblocks - 1 - r  # sigma_range_idx for rank r
+		s_lo, s_hi = bs[ri], bs[ri + 1]
+		in_range = ((s >= s_lo) & (s <= s_hi)).float().mean().item()
+		lines.append(f"  rank {r}: range=[{s_lo:.4f},{s_hi:.4f}]  "
+		             f"min={s.min():.4f} max={s.max():.4f} "
+		             f"in_range={in_range:.2f}  "
+		             f"first3={[round(x,4) for x in s[:3].tolist()]}")
+	normed = []
+	for r, s in enumerate(gathered):
+		ri = model.num_dblocks - 1 - r
+		log_lo = math.log(bs[ri])
+		log_hi = math.log(bs[ri + 1])
+		normed.append((torch.log(s) - log_lo) / (log_hi - log_lo))
+	r_pearson = torch.corrcoef(torch.stack(normed))[0, 1].item()
+	lines.append(f"  Pearson r (log-normalized, ≈ underlying u): {r_pearson:.4f}  "
+	             f"({'OK' if abs(r_pearson) < 0.1 else 'CORRELATED — check RNG'})")
+	lines.append("--- end σ diagnostic ---")
+	diag_path = os.path.join(out_dir, 'sigma_diagnostic.txt')
+	with open(diag_path, 'w') as f:
+		f.write('\n'.join(lines) + '\n')
+	print('\n'.join(lines))  # also print for live runs
+
+_sigma_diagnostic()
 
 # ---------------------------------------------------------------------------
 # training loop

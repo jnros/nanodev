@@ -311,6 +311,19 @@ while True:
 			if losses['val'] < best_val_loss:
 				best_val_loss = losses['val'].item()
 				best_val_ce   = losses['val_ce'].item()
+				if iter_num > 0:
+					# assemble_all_blocks already ran in estimate_loss;
+					# rank 0 has the full model — save it.
+					ckpt = {
+						'model':      model.state_dict(),
+						'optimizer':  optimizer.state_dict(),
+						'model_args': model_args,
+						'iter_num':   iter_num,
+						'best_val_loss': best_val_loss,
+						'config':     config,
+					}
+					torch.save(ckpt, os.path.join(out_dir, 'ckpt.pt'))
+					print(f"saved checkpoint to {out_dir} (val_ce={best_val_ce:.4f})")
 
 	if iter_num == 0 and eval_only:
 		break

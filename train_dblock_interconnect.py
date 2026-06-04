@@ -65,6 +65,7 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = False  # compile + method monkeypatch don't mix
 num_dblocks = 2  # must equal world_size (one block per GPU)
 sync_interval = 1  # shared param sync every N optimizer steps; large N = less comm
+seed = 1337
 # -----------------------------------------------------------------------------
 config_keys = [k for k, v in globals().items()
                if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -89,7 +90,7 @@ assert num_dblocks == world_size, \
 my_block = rank  # rank r owns layer_assignment[r]
 
 # same seed everywhere → same data on all ranks (controlled comparison)
-torch.manual_seed(1337)
+torch.manual_seed(seed)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16,
@@ -143,7 +144,7 @@ def _make_block_sampler(m, blk_idx):
 	# rank-local generator: σ samples independent across ranks.
 	# data loading keeps the shared global RNG for controlled batch comparison.
 	_gen = torch.Generator()
-	_gen.manual_seed(1337 + blk_idx * 10007)  # wide spacing; hash() avoided (PYTHONHASHSEED)
+	_gen.manual_seed(seed + blk_idx * 10007)  # wide spacing; hash() avoided (PYTHONHASHSEED)
 
 	def _sample(self, n, dev):
 		u = torch.rand(n, generator=_gen)

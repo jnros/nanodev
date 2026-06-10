@@ -189,7 +189,13 @@ def assemble_all_blocks():
 
 @torch.no_grad()
 def estimate_loss():
-	# sync shared, gather all block params → rank 0 has full model
+	# snapshot all params that sync_shared_params / assemble_all_blocks will
+	# mutate in-place, so training state is byte-identical after eval.
+	# must cover BOTH shared params (averaged by sync_shared_params) AND all
+	# block layers (overwritten by assemble_all_blocks broadcast).
+	saved = {name: param.data.clone()
+	         for name, param in model.named_parameters()}
+
 	sync_shared_params()
 	assemble_all_blocks()
 	out = {}
@@ -211,6 +217,11 @@ def estimate_loss():
 		model.train()
 		# restore rank-specific sampler
 		model._sample_sigmas = _make_block_sampler(model, my_block)
+
+	# restore pre-eval weights on every rank
+	for name, param in model.named_parameters():
+		param.data.copy_(saved[name])
+
 	return out
 
 # ---------------------------------------------------------------------------
@@ -294,6 +305,10 @@ while True:
 
 	if iter_num % eval_interval == 0:
 		losses = estimate_loss()
+		# estimate_loss() restores pre-eval weights on every rank.
+
+		# rank 0 decides whether to checkpoint; broadcast so all ranks act.
+		do_save = torch.zeros(1, dtype=torch.bool, device=device)
 		if master:
 			print(f"step {iter_num}: "
 			      f"train {losses['train']:.4f} (ce {losses['train_ce']:.4f}), "
@@ -312,18 +327,42 @@ while True:
 				best_val_loss = losses['val'].item()
 				best_val_ce   = losses['val_ce'].item()
 				if iter_num > 0:
-					# assemble_all_blocks already ran in estimate_loss;
-					# rank 0 has the full model — save it.
-					ckpt = {
-						'model':      model.state_dict(),
-						'optimizer':  optimizer.state_dict(),
-						'model_args': model_args,
-						'iter_num':   iter_num,
-						'best_val_loss': best_val_loss,
-						'config':     config,
-					}
-					torch.save(ckpt, os.path.join(out_dir, 'ckpt.pt'))
-					print(f"saved checkpoint to {out_dir} (val_ce={best_val_ce:.4f})")
+					do_save.fill_(True)
+		dist.broadcast(do_save, src=0)
+
+		if do_save.item():
+			# 1. Each rank saves its own trained state (own block + own shared
+			#    params) before any sync/assemble.  eval_interconnect_controls.py
+			#    uses these to run interface-isolation controls.
+			torch.save({
+				'model':          model.state_dict(),
+				'optimizer':      optimizer.state_dict(),
+				'model_args':     model_args,
+				'iter_num':       iter_num,
+				'rank':           rank,
+				'my_block':       my_block,
+				'layer_assignment': model.layer_assignment,
+				'config':         config,
+			}, os.path.join(out_dir, f'ckpt_rank{rank}.pt'))
+
+			# 2. Re-assemble full model on rank 0 for ckpt.pt (inference /
+			#    backward compat), then restore training state.
+			saved2 = {k: v.data.clone() for k, v in model.named_parameters()}
+			sync_shared_params()
+			assemble_all_blocks()
+			if master:
+				torch.save({
+					'model':         model.state_dict(),
+					'optimizer':     optimizer.state_dict(),
+					'model_args':    model_args,
+					'iter_num':      iter_num,
+					'best_val_loss': best_val_loss,
+					'config':        config,
+				}, os.path.join(out_dir, 'ckpt.pt'))
+				print(f"saved checkpoint to {out_dir} (val_ce={best_val_ce:.4f})")
+			for name, param in model.named_parameters():
+				param.data.copy_(saved2[name])
+			dist.barrier()
 
 	if iter_num == 0 and eval_only:
 		break

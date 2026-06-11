@@ -48,6 +48,8 @@ The amortized network traffic at K=1000 is 9.71 KB per step vs 66.5 MB for stand
 
 We swept K ∈ {1, 10, 100, 1000, ∞} on enwik8 L=6, 60k iterations. K=1 through K=1000 land within 0.02 CE of each other — the curve is essentially flat. Sync less, pay nothing.
 
+![interconnect summary](interconnect_summary.png)
+
 K=∞ diverges. Best CE of 3.25 at iteration 2000, climbing to ~8 by the end. These specialists still need a foreman: the shared interface is load-bearing. It carries the consensus signal that keeps two independently-trained denoising experts pointing at the same language distribution. Cut it entirely and they drift apart.
 
 The open question is where the knee is. K=1000 is fine. K=∞ is not. Somewhere between them is a threshold worth finding.

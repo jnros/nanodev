@@ -42,7 +42,7 @@ The structural win from the implementation — blocks don't need each other duri
 
 Two GPUs, one block each. Block weights (the transformer layers) are never communicated. Only the shared interface — token embed, pos embed, final LayerNorm, output head — is all-reduced every K steps. No DDP wrapper, no automatic gradient sync.
 
-![interconnect diagram](paper/figures/inter_dia3-1.png)
+![interconnect diagram](inter_dia3-1.png)
 
 The amortized network traffic at K=1000 is 9.71 KB per step vs 66.5 MB for standard DDP. 7000× less.
 

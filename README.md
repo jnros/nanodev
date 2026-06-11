@@ -11,6 +11,7 @@ Each block gets its own fresh noise sample at its assigned σ — not the output
 The published Sakana repo implements only image classification; the AR language-model results in the paper aren't open-sourced. So I cloned Karpathy's nanoGPT (he's my sensei) and added diffusion where it don't belong.
 
 6-layer causal GPT, Shakespeare-char, A100 GPU.
+![loss curves by depth](loss_curves_overlay.png)
 
 **Peak VRAM:** 1628 → 758 MB (2.16× reduction). Only 2 of 6 layers run per step on a single GPU. The bigger structural win: those 2 layers don't need the other 4 at all. They could be on a different machine, trained by a different team.
 
@@ -31,9 +32,9 @@ Everything else is unmodified Karpathy.
 
 Does the CE gap widen or close as the model gets deeper? We ran enwik8 at L=6, 8, 10, 12 (n_embd=384) with matched iteration budgets.
 
-![loss curves by depth](loss_curves_overlay.png)
-
 Gap at L=6: 0.69. Gap at L=12: 0.61. It shrinks. No collapse, no instability. Many layer-wise training methods fail at scale; this one doesn't.
+
+![loss curves by depth](enwik8_gap_vram.png)
 
 ## Decoupled training across devices
 

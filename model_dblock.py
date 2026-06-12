@@ -213,20 +213,19 @@ class GPTDBlock(GPT):
 		return logits, edm_loss, ce_loss
 
 	def forward_multistep_eval(self, idx: torch.Tensor, targets: torch.Tensor,
-	                           n_steps: int = 1):
-		"""ODE discretization diagnostic: Euler trajectory within each block's σ band.
+	                           n_steps: int = 1, solver: str = 'euler'):
+		"""ODE discretization diagnostic: ODE trajectory within each block's σ band.
 
 		Each block evaluated independently (not chained). For each block:
 		  - start from noisy token embeddings at σ_hi of that block's band
-		  - take n_steps-1 Euler steps (prob-flow ODE) then x0-prediction at σ_lo
-		  - total NFE per block = n_steps
+		  - take n_steps-1 solver steps (prob-flow ODE) then x0-prediction at σ_lo
+
+		solver='euler': n_steps NFE per block (Karras et al. eq. 2)
+		solver='heun':  2*(n_steps-1)+1 NFE per block (EDM Algorithm 1)
 
 		Returns:
 		  ce_final  -- CE through lm_head for last block only (the only meaningful CE)
 		  mse_list  -- MSE of denoised vs clean token embeddings, one per block
-
-		Diagnostic: CE/MSE decreasing with n_steps → ODE discretization is real.
-		Per-block MSE reveals whether gains concentrate in low-σ (fine) blocks.
 		"""
 		device = idx.device
 		b, t = idx.size()
@@ -234,7 +233,6 @@ class GPTDBlock(GPT):
 		pos = torch.arange(t, device=device)
 
 		def _denoise(zt, sigma_vec, blk_idx):
-			# sigma_vec: [b] scalar σ per sample
 			s2  = sigma_vec ** 2
 			sd2 = self.sigma_data ** 2
 			c_s = sd2 / (s2 + sd2)
@@ -256,8 +254,7 @@ class GPTDBlock(GPT):
 			s_lo   = self.block_sigmas[actual]
 			s_hi   = self.block_sigmas[actual + 1]
 
-			# n_steps NFE: n_steps-1 Euler steps, then x0-prediction at sigmas[-1]
-			# linspace(s_hi, s_lo, n_steps): n_steps=1 → [s_hi], n_steps=2 → [s_hi,s_lo]
+			# linspace in log-σ: n_steps=1 → [s_hi], n_steps=2 → [s_hi, s_lo]
 			sigmas = torch.linspace(math.log(s_hi), math.log(s_lo),
 			                        n_steps, device=device).exp()
 
@@ -266,12 +263,23 @@ class GPTDBlock(GPT):
 			for k in range(n_steps - 1):
 				s_k   = sigmas[k].expand(b)
 				s_kp1 = sigmas[k + 1].expand(b)
-				denoised = _denoise(zt, s_k, blk)
-				# probability-flow ODE Euler step (Karras et al. eq. 2)
-				zt = zt + (zt - denoised) / s_k[:, None, None] \
-				         * (s_kp1 - s_k)[:, None, None]
+				dt    = (s_kp1 - s_k)[:, None, None]
+				denoised_k = _denoise(zt, s_k, blk)
+				d1 = (zt - denoised_k) / s_k[:, None, None]
+				if solver == 'heun':
+					# 2nd-order Heun corrector (EDM Algorithm 1)
+					zt_pred    = zt + d1 * dt
+					denoised_p = _denoise(zt_pred, s_kp1, blk)
+					d2 = (zt_pred - denoised_p) / s_kp1[:, None, None]
+					zt = zt + 0.5 * (d1 + d2) * dt
+				elif solver == 'renoise':
+					# ancestral/SDE: re-noise x0 estimate — forces every query
+					# back to training distribution (z + σ'·noise)
+					zt = denoised_k + s_kp1[:, None, None] * torch.randn_like(z)
+				else:
+					zt = zt + d1 * dt
 
-			# x0-prediction at sigmas[-1]: the n_steps-th (final) NFE
+			# final x0-prediction (1 NFE)
 			denoised = _denoise(zt, sigmas[-1].expand(b), blk)
 
 			mse = ((denoised - z) ** 2).mean()

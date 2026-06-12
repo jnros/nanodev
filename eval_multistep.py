@@ -1,11 +1,14 @@
 """ODE discretization diagnostic.
 
-Loads a dblock checkpoint, sweeps n_steps (NFE per block) over the val set,
+Loads a dblock checkpoint, sweeps n_steps over the val set,
 prints per-block MSE + final-block CE vs n_steps.
 
+solver=euler: n_steps NFE per block
+solver=heun:  2*(n_steps-1)+1 NFE per block (EDM Algorithm 1, 2nd-order)
+
 Diagnostic readout:
-  - CE/MSE decreasing within the sweep → ODE discretization is a real gap source
-  - Gains concentrated in low-σ (last) blocks → fine-detail blocks are the bottleneck
+  - CE/MSE monotonically decreasing with n_steps → discretization is a real gap source
+  - Euler diverges at n_steps≥4 (wide σ bands); Heun should remain stable
   - Flat curve → gap is bias (target mismatch / block composition), not discretization
 
 NOTE: the baseline row uses the chained random-σ forward (different eval protocol).
@@ -15,7 +18,7 @@ NOTE: the baseline row uses the chained random-σ forward (different eval protoc
 Usage:
     uv run python eval_multistep.py --out_dir=out-shakespeare-char-dblock-B3 \
         [--data_dir=data/shakespeare_char] [--eval_iters=200] [--batch_size=64] \
-        [--steps 1 2 4 8 16 32]
+        [--steps 1 2 4 8 16 32] [--solver euler|heun]
 """
 import argparse
 import math
@@ -37,6 +40,7 @@ def parse_args():
 	p.add_argument('--batch_size', type=int, default=64)
 	p.add_argument('--device',     default='cuda' if torch.cuda.is_available() else 'cpu')
 	p.add_argument('--steps', type=int, nargs='+', default=[1, 2, 4, 8, 16, 32])
+	p.add_argument('--solver', default='euler', choices=['euler', 'heun', 'renoise'])
 	return p.parse_args()
 
 
@@ -63,15 +67,17 @@ def eval_standard(model, data_path, block_size, batch_size, device, eval_iters):
 
 
 @torch.no_grad()
-def eval_sweep(model, data_path, block_size, batch_size, device, eval_iters, n_steps):
-	"""Per-block MSE + final-block CE using ODE Euler trajectory."""
+def eval_sweep(model, data_path, block_size, batch_size, device, eval_iters,
+               n_steps, solver):
+	"""Per-block MSE + final-block CE using ODE trajectory."""
 	model.eval()
 	B = model.num_dblocks
 	ce_acc   = 0.0
 	mse_acc  = [0.0] * B
 	for _ in range(eval_iters):
 		X, Y = get_batch(data_path, block_size, batch_size, device)
-		ce, mse_list = model.forward_multistep_eval(X, Y, n_steps=n_steps)
+		ce, mse_list = model.forward_multistep_eval(X, Y, n_steps=n_steps,
+		                                             solver=solver)
 		ce_acc  += ce.item()
 		for b, m in enumerate(mse_list):
 			mse_acc[b] += m.item()
@@ -104,9 +110,15 @@ def main():
 	block_size = model_args['block_size']
 	B          = model.num_dblocks
 
+	def nfe(n):
+		if args.solver == 'heun':
+			return 2 * (n - 1) + 1
+		return n   # euler and renoise both cost n NFE
+
 	print(f"checkpoint : {args.out_dir}  iter={ckpt['iter_num']}")
 	print(f"dataset    : {dataset}  val={val_path}")
 	print(f"num_dblocks: {B}   n_layer={model_args['n_layer']}")
+	print(f"solver     : {args.solver}")
 	print(f"σ bands    : {['%.4f–%.4f' % (model.block_sigmas[B-1-b], model.block_sigmas[B-b]) for b in range(B)]}")
 	print()
 
@@ -116,15 +128,15 @@ def main():
 
 	# header
 	mse_hdrs = '  '.join(f'blk{b}_mse' for b in range(B))
-	print(f"{'n_steps':>8}  {'final_ce':>9}  {mse_hdrs}")
-	print(f"{'baseline*':>8}  {base_ce:9.4f}  {'(chained random-σ, different protocol)':}")
+	print(f"{'n_steps':>8}  {'nfe':>5}  {'final_ce':>9}  {mse_hdrs}")
+	print(f"{'baseline*':>8}  {'':>5}  {base_ce:9.4f}  {'(chained random-σ, different protocol)':}")
 	print()
 
 	for n in args.steps:
 		ce, mses = eval_sweep(model, val_path, block_size, args.batch_size,
-		                      args.device, args.eval_iters, n)
+		                      args.device, args.eval_iters, n, args.solver)
 		mse_cols = '  '.join(f'{m:9.5f}' for m in mses)
-		print(f"{n:>8}  {ce:9.4f}  {mse_cols}")
+		print(f"{n:>8}  {nfe(n):>5}  {ce:9.4f}  {mse_cols}")
 
 	print()
 	print("* baseline: chained random-σ forward; not comparable to sweep rows.")

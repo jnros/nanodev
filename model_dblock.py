@@ -211,3 +211,75 @@ class GPTDBlock(GPT):
 			edm_loss = (per_seq * w).mean()
 
 		return logits, edm_loss, ce_loss
+
+	def forward_multistep_eval(self, idx: torch.Tensor, targets: torch.Tensor,
+	                           n_steps: int = 1):
+		"""ODE discretization diagnostic: Euler trajectory within each block's σ band.
+
+		Each block evaluated independently (not chained). For each block:
+		  - start from noisy token embeddings at σ_hi of that block's band
+		  - take n_steps-1 Euler steps (prob-flow ODE) then x0-prediction at σ_lo
+		  - total NFE per block = n_steps
+
+		Returns:
+		  ce_final  -- CE through lm_head for last block only (the only meaningful CE)
+		  mse_list  -- MSE of denoised vs clean token embeddings, one per block
+
+		Diagnostic: CE/MSE decreasing with n_steps → ODE discretization is real.
+		Per-block MSE reveals whether gains concentrate in low-σ (fine) blocks.
+		"""
+		device = idx.device
+		b, t = idx.size()
+		z   = self.transformer.wte(idx)   # clean token embeddings [b,t,d]
+		pos = torch.arange(t, device=device)
+
+		def _denoise(zt, sigma_vec, blk_idx):
+			# sigma_vec: [b] scalar σ per sample
+			s2  = sigma_vec ** 2
+			sd2 = self.sigma_data ** 2
+			c_s = sd2 / (s2 + sd2)
+			c_o = sigma_vec * self.sigma_data / (s2 + sd2).sqrt()
+			c_i = 1.0 / (s2 + sd2).sqrt()
+			c_n = 0.25 * sigma_vec.log()
+			x = zt * c_i[:, None, None] + self.transformer.wpe(pos)
+			for i in self.layer_assignment[blk_idx]:
+				x = self.transformer.h[i](x, c_n)
+			x = self.transformer.ln_f(x)
+			return x * c_o[:, None, None] + zt * c_s[:, None, None]
+
+		mse_list  = []
+		ce_final  = None
+
+		for blk in range(self.num_dblocks):
+			# block 0 = high σ (coarse); reversed from block_sigmas (low→high)
+			actual = self.num_dblocks - 1 - blk
+			s_lo   = self.block_sigmas[actual]
+			s_hi   = self.block_sigmas[actual + 1]
+
+			# n_steps NFE: n_steps-1 Euler steps, then x0-prediction at sigmas[-1]
+			# linspace(s_hi, s_lo, n_steps): n_steps=1 → [s_hi], n_steps=2 → [s_hi,s_lo]
+			sigmas = torch.linspace(math.log(s_hi), math.log(s_lo),
+			                        n_steps, device=device).exp()
+
+			zt = z + sigmas[0] * torch.randn_like(z)
+
+			for k in range(n_steps - 1):
+				s_k   = sigmas[k].expand(b)
+				s_kp1 = sigmas[k + 1].expand(b)
+				denoised = _denoise(zt, s_k, blk)
+				# probability-flow ODE Euler step (Karras et al. eq. 2)
+				zt = zt + (zt - denoised) / s_k[:, None, None] \
+				         * (s_kp1 - s_k)[:, None, None]
+
+			# x0-prediction at sigmas[-1]: the n_steps-th (final) NFE
+			denoised = _denoise(zt, sigmas[-1].expand(b), blk)
+
+			mse = ((denoised - z) ** 2).mean()
+			mse_list.append(mse)
+
+			if blk == self.num_dblocks - 1:
+				logits   = self.lm_head(denoised)
+				ce_final = F.cross_entropy(
+				    logits.view(-1, logits.size(-1)), targets.view(-1))
+
+		return ce_final, mse_list

@@ -5,6 +5,7 @@
   - saves dblock_summary.json + loss_curves.json with both loss types
 """
 
+import copy
 import os
 import time
 import math
@@ -56,6 +57,7 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True
 # DBlock-specific
 num_dblocks = 3
+ema_decay = 0.999
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items()
                if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -155,6 +157,11 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size
 model.to(device)
 
+ema_model = copy.deepcopy(model)
+for p in ema_model.parameters():
+    p.requires_grad_(False)
+ema_model.eval()
+
 scaler    = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 optimizer = model.configure_optimizers(weight_decay, learning_rate,
                                        (beta1, beta2), device_type)
@@ -174,21 +181,25 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss(eval_model=None):
+    is_train_model = eval_model is None
+    if is_train_model:
+        eval_model = model
     out = {}
-    model.eval()
+    eval_model.eval()
     for split in ['train', 'val']:
         edm_losses = torch.zeros(eval_iters)
         ce_losses  = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                _, edm_loss, ce_loss = model(X, Y)
+                _, edm_loss, ce_loss = eval_model(X, Y)
             edm_losses[k] = edm_loss.item()
             ce_losses[k]  = ce_loss.item()
         out[split]            = edm_losses.mean()
         out[f'{split}_ce']    = ce_losses.mean()
-    model.train()
+    if is_train_model:
+        eval_model.train()
     return out
 
 def get_lr(it):
@@ -218,10 +229,12 @@ while True:
         param_group['lr'] = lr
 
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
+        losses     = estimate_loss()
+        ema_losses = estimate_loss(ema_model)
         print(f"step {iter_num}: "
               f"train loss {losses['train']:.4f} (ce {losses['train_ce']:.4f}), "
-              f"val loss {losses['val']:.4f} (ce {losses['val_ce']:.4f})")
+              f"val loss {losses['val']:.4f} (ce {losses['val_ce']:.4f}), "
+              f"ema val ce {ema_losses['val_ce']:.4f}")
         peak_mb = torch.cuda.max_memory_allocated() / 1024**2 if device_type == 'cuda' else 0
         loss_log.append({
             'iter':         iter_num,
@@ -229,6 +242,7 @@ while True:
             'val':          losses['val'].item(),
             'train_ce':     losses['train_ce'].item(),
             'val_ce':       losses['val_ce'].item(),
+            'ema_val_ce':   ema_losses['val_ce'].item(),
             'peak_vram_mb': peak_mb,
         })
         if wandb_log:
@@ -274,6 +288,9 @@ while True:
     scaler.step(optimizer)
     scaler.update()
     optimizer.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        for ep, p in zip(ema_model.parameters(), raw_model.parameters()):
+            ep.mul_(ema_decay).add_(p.data, alpha=1.0 - ema_decay)
 
     t1 = time.time()
     dt = t1 - t0

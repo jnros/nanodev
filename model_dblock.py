@@ -63,8 +63,12 @@ class AdaLayerNorm(nn.Module):
 		nn.init.zeros_(self.mod[-1].bias)
 
 	def forward(self, x: torch.Tensor, c_noise: torch.Tensor) -> torch.Tensor:
-		# c_noise: [B]  →  mod: [B, 1, 2*n_embd]
-		mod = self.mod(c_noise.unsqueeze(-1)).unsqueeze(1)
+		# c_noise: [B] (broadcast over T)  ->  mod [B,1,2d]
+		#       or [B,T] (per-position, clean-noisy 2S)  ->  mod [B,T,2d]
+		if c_noise.dim() == 1:
+			mod = self.mod(c_noise.unsqueeze(-1)).unsqueeze(1)
+		else:
+			mod = self.mod(c_noise.unsqueeze(-1))
 		scale, shift = mod.chunk(2, dim=-1)
 		return (1.0 + scale) * self.ln(x) + shift
 
@@ -82,8 +86,9 @@ class DBlock(nn.Module):
 		self.ln_2 = AdaLayerNorm(config.n_embd, config.bias)
 		self.mlp  = MLP(config)
 
-	def forward(self, x: torch.Tensor, c_noise: torch.Tensor) -> torch.Tensor:
-		x = x + self.attn(self.ln_1(x, c_noise))
+	def forward(self, x: torch.Tensor, c_noise: torch.Tensor,
+	            attn_mask=None) -> torch.Tensor:
+		x = x + self.attn(self.ln_1(x, c_noise), attn_mask=attn_mask)
 		x = x + self.mlp(self.ln_2(x, c_noise))
 		return x
 
@@ -130,6 +135,7 @@ class GPTDBlock(GPT):
 			list(range(i * split, (i + 1) * split))
 			for i in range(num_dblocks)
 		]
+		self._mask_cache = {}
 
 	# --- σ helpers ---
 
@@ -162,6 +168,29 @@ class GPTDBlock(GPT):
 		w = (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data)**2
 		return w / w.mean()
 
+	def _clean_noisy_mask(self, s: int, device) -> torch.Tensor:
+		"""2S×2S bool mask (True = attend) for [clean(0..s-1), noisy(0..s-1)].
+
+		  clean→clean : causal      (k ≤ q)        — clean memory self-builds
+		  clean→noisy : blocked                    — clean never sees noisy
+		  noisy→clean : strict causal (k < q)      — denoise on REAL (clean) past
+		  noisy→noisy : diagonal only (k == q)     — no noisy-to-noisy leakage
+		"""
+		key = (s, str(device))
+		m = self._mask_cache.get(key)
+		if m is not None:
+			return m
+		i = torch.arange(s, device=device)
+		causal = i[:, None] >= i[None, :]              # [s,s] k ≤ q
+		strict = i[:, None] >  i[None, :]              # [s,s] k < q
+		eye    = torch.eye(s, dtype=torch.bool, device=device)
+		zero   = torch.zeros(s, s, dtype=torch.bool, device=device)
+		top    = torch.cat([causal, zero], dim=1)      # clean queries
+		bot    = torch.cat([strict, eye],  dim=1)      # noisy queries
+		m = torch.cat([top, bot], dim=0)               # [2s,2s]
+		self._mask_cache[key] = m
+		return m
+
 	# --- forward ---
 
 	def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
@@ -178,24 +207,43 @@ class GPTDBlock(GPT):
 		c_in    = 1.0 / (s2 + sd2).sqrt()
 		c_noise = 0.25 * sigma.log()
 
-		z   = self.transformer.wte(idx)
-		# DBLOCK 5/6: noise all token embeddings with the sampled σ.
-		zt  = z + sigma[:, None, None] * torch.randn_like(z)
+		# clean stream conditioning: σ_min sentinel = bottom of lowest block band.
+		sigma_min     = self.block_sigmas[0]
+		c_in_clean    = 1.0 / math.sqrt(sigma_min ** 2 + sd2)
+		c_noise_clean = 0.25 * math.log(sigma_min)
 
+		z   = self.transformer.wte(idx)                       # clean  [b,t,d]
+		# DBLOCK 5/6: noise token embeddings (noisy stream only).
+		zt  = z + sigma[:, None, None] * torch.randn_like(z)  # noisy  [b,t,d]
+
+		# Block-Diffusion clean-conditioning: concat clean+noisy → 2t.
+		# both halves share positions 0..t-1.
 		pos = torch.arange(t, device=device)
-		x   = self.transformer.drop(
-		        zt * c_in[:, None, None] + self.transformer.wpe(pos))
+		wpe = self.transformer.wpe(pos)                       # [t,d]
+		x_clean = z  * c_in_clean        + wpe
+		x_noisy = zt * c_in[:, None, None] + wpe
+		x = self.transformer.drop(torch.cat([x_clean, x_noisy], dim=1))  # [b,2t,d]
+
+		# per-position c_noise: clean half = σ_min sentinel, noisy half = sampled σ.
+		cn = torch.cat([
+		        torch.full((b, t), c_noise_clean, device=device,
+		                   dtype=c_noise.dtype),
+		        c_noise[:, None].expand(b, t),
+		     ], dim=1)                                        # [b,2t]
+
+		mask = self._clean_noisy_mask(t, device)              # [2t,2t]
 
 		# DBLOCK 6/6: run only the assigned block's layers — no gradient flows
 		# to other blocks. this is the whole mechanism.
 		blk = self._target_block(sigma)
 		for i in self.layer_assignment[blk]:
-			x = self.transformer.h[i](x, c_noise)
+			x = self.transformer.h[i](x, cn, attn_mask=mask)
 
 		x = self.transformer.ln_f(x)
 
-		denoised = (x  * c_out[:, None, None]
-		            + zt * c_skip[:, None, None])
+		x_noisy_out = x[:, t:, :]                             # noisy half only
+		denoised = (x_noisy_out * c_out[:, None, None]
+		            + zt        * c_skip[:, None, None])
 
 		logits = self.lm_head(denoised)
 
@@ -211,6 +259,162 @@ class GPTDBlock(GPT):
 			edm_loss = (per_seq * w).mean()
 
 		return logits, edm_loss, ce_loss
+
+	# --- chained (composed) inference: the deployment sampler ---
+
+	def _build_sigma_grid(self, n_steps: int, grid: str, device,
+	                      sigma_min=None, sigma_max=None) -> torch.Tensor:
+		"""Descending σ schedule spanning the full range (high → low)."""
+		s_min = sigma_min if sigma_min is not None else self.block_sigmas[0]
+		s_max = sigma_max if sigma_max is not None else self.block_sigmas[-1]
+
+		if grid == 'global':
+			# one geometric (log-uniform) grid over whole range, descending
+			return torch.linspace(math.log(s_max), math.log(s_min),
+			                      n_steps, device=device).exp()
+
+		if grid == 'perband':
+			# n_steps points inside EACH block's band, top band → bottom band.
+			# block 0 owns the highest band; block_sigmas ascending, so reverse.
+			chunks = []
+			for blk in range(self.num_dblocks):
+				actual = self.num_dblocks - 1 - blk
+				lo = self.block_sigmas[actual]
+				hi = self.block_sigmas[actual + 1]
+				band = torch.linspace(math.log(hi), math.log(lo),
+				                      n_steps, device=device).exp()
+				# drop duplicated boundary between consecutive bands
+				chunks.append(band if blk == 0 else band[1:])
+			return torch.cat(chunks)
+
+		raise ValueError(f"unknown grid '{grid}'")
+
+	def _denoise_chained(self, z_clean, zt, sigma_scalar, pos):
+		"""Clean-conditioned denoiser query at one scalar σ; block chosen by σ.
+
+		Block-Diffusion clean-conditioning: the noisy stream `zt` is denoised
+		conditioned on the FIXED clean stream `z_clean` (clean past only, via the
+		2S mask) — the AR property the old single-stream path lacked. Only the
+		noisy half is returned. x0 = softmax(logits) @ wte.weight is taken by the
+		caller (Sakana diffusion_step semantics; weight-tied head).
+
+		Returns (logits, block_idx) for the noisy half [b,t,V].
+		"""
+		b, t = zt.size(0), zt.size(1)
+		sig = sigma_scalar.expand(b)
+		s2  = sig ** 2
+		sd2 = self.sigma_data ** 2
+		c_skip  = sd2 / (s2 + sd2)
+		c_out   = sig * self.sigma_data / (s2 + sd2).sqrt()
+		c_in    = 1.0 / (s2 + sd2).sqrt()
+		c_noise = 0.25 * sig.log()
+
+		sigma_min     = self.block_sigmas[0]
+		c_in_clean    = 1.0 / math.sqrt(sigma_min ** 2 + sd2)
+		c_noise_clean = 0.25 * math.log(sigma_min)
+
+		wpe = self.transformer.wpe(pos)
+		x_clean = z_clean * c_in_clean        + wpe
+		x_noisy = zt      * c_in[:, None, None] + wpe
+		x = self.transformer.drop(torch.cat([x_clean, x_noisy], dim=1))
+
+		cn = torch.cat([
+		        torch.full((b, t), c_noise_clean, device=zt.device,
+		                   dtype=c_noise.dtype),
+		        c_noise[:, None].expand(b, t),
+		     ], dim=1)
+		mask = self._clean_noisy_mask(t, zt.device)
+
+		blk = self._target_block(sig)                       # the block switch
+		for i in self.layer_assignment[blk]:
+			x = self.transformer.h[i](x, cn, attn_mask=mask)
+		x = self.transformer.ln_f(x)
+
+		x_noisy_out = x[:, t:, :]
+		denoised = x_noisy_out * c_out[:, None, None] + zt * c_skip[:, None, None]
+		logits   = self.lm_head(denoised)
+		return logits, blk
+
+	@torch.no_grad()
+	def forward_chained_eval(self, idx: torch.Tensor, targets: torch.Tensor,
+	                         n_steps: int = 64, solver: str = 'euler',
+	                         grid: str = 'global', from_noise: bool = True,
+	                         sigma_min=None, sigma_max=None):
+		"""Composed trajectory across ALL blocks — the FAITHFUL deployment sampler.
+
+		Walks the full descending σ schedule, switching blocks via _target_block
+		as σ descends, threading ODE state z across block boundaries. This is the
+		Gap-B measurement: what composition actually costs.
+
+		CLEAN-CONDITIONING (Block Diffusion): the evolving noisy stream is denoised
+		conditioned on the FIXED clean stream = true tokens (teacher-forced clean
+		past, via the 2S mask in _denoise_chained). This is the AR likelihood under
+		the composed sampler — the property the old single-stream path lacked.
+
+		x0 = softmax(logits) @ wte.weight  (Sakana diffusion_step; weight-tied head).
+		Euler prob-flow ODE in embedding space; optional Heun corrector.
+
+		from_noise=True  : pure-noise init of the noisy stream (faithful deployment;
+		                   clean past still supplied as conditioning).
+		from_noise=False : z_clean + σ_max·noise init (reconstruction framing).
+
+		Returns dict:
+		  ce            -- CE through lm_head at the final (lowest) σ vs targets
+		  mse_to_clean  -- ||final x0 − clean embeddings||²  (drift indicator)
+		  blocks        -- block idx visited per step (shows the chaining)
+		  mse_trace     -- per-step ||x0_k − clean||²  (watch for compounding)
+		"""
+		device   = idx.device
+		b, t     = idx.size()
+		pos      = torch.arange(t, device=device)
+		z_clean  = self.transformer.wte(idx)                # [b,t,d]
+		wte_w    = self.transformer.wte.weight              # [V,d] (tied head)
+
+		sigmas = self._build_sigma_grid(n_steps, grid, device,
+		                                sigma_min, sigma_max)
+
+		if from_noise:
+			zt = torch.randn_like(z_clean) * math.sqrt(1.0 + sigmas[0].item()**2)
+		else:
+			zt = z_clean + sigmas[0] * torch.randn_like(z_clean)
+
+		blocks, mse_trace = [], []
+
+		for k in range(sigmas.shape[0] - 1):
+			s_k   = sigmas[k]
+			s_kp1 = sigmas[k + 1]
+			dt    = s_kp1 - s_k
+
+			logits, blk = self._denoise_chained(z_clean, zt, s_k, pos)
+			blocks.append(blk)
+			x0 = F.softmax(logits, dim=-1) @ wte_w
+			mse_trace.append(((x0 - z_clean) ** 2).mean().item())
+
+			d = (zt - x0) / s_k
+
+			if solver == 'heun':
+				zt_pred = zt + d * dt
+				logits2, _ = self._denoise_chained(z_clean, zt_pred, s_kp1, pos)
+				x0_2 = F.softmax(logits2, dim=-1) @ wte_w
+				d2   = (zt_pred - x0_2) / s_kp1
+				zt   = zt + 0.5 * (d + d2) * dt
+			else:  # euler
+				zt = zt + d * dt
+
+		# final denoise at lowest σ — the CE we report (Sakana returns
+		# denoise(...) at min σ).
+		logits, blk = self._denoise_chained(z_clean, zt, sigmas[-1], pos)
+		blocks.append(blk)
+		x0_final = F.softmax(logits, dim=-1) @ wte_w
+
+		ce = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+		return {
+			'ce': ce.item(),
+			'mse_to_clean': ((x0_final - z_clean) ** 2).mean().item(),
+			'blocks': blocks,
+			'mse_trace': mse_trace,
+		}
 
 	def forward_multistep_eval(self, idx: torch.Tensor, targets: torch.Tensor,
 	                           n_steps: int = 1, solver: str = 'euler'):

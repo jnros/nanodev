@@ -9,12 +9,18 @@ distribution, the blocks are only valid near their training input distribution �
 not along the actual integration path.  That's a training-time finding about
 the gap, not a sampler-design finding.
 
+--chain threads the off-manifold trajectory ACROSS block boundaries: block k+1
+starts integrating from block k's exit state, not from a fresh z + σ·noise.
+This measures cross-block error inheritance — the actual chained-inference path.
+Default (off) self-seeds each block from clean data (within-block self-drift).
+
 Output: one table per block, MSE(σ) for both conditions, σ grid on block band.
+Written to eval_offmanifold_{chain,nochain}_{out_dir}.txt and to stdout.
 
 Usage:
     uv run python eval_offmanifold.py --out_dir=out-shakespeare-char-dblock-B3 \
         [--data_dir=data/shakespeare_char] [--eval_iters=50] [--batch_size=64] \
-        [--n_grid=8]
+        [--n_grid=8] [--chain]
 """
 import argparse
 import math
@@ -22,6 +28,7 @@ import os
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from model import GPTConfig
 from model_dblock import GPTDBlock
@@ -35,6 +42,9 @@ def parse_args():
 	p.add_argument('--batch_size', type=int, default=64)
 	p.add_argument('--n_grid',     type=int, default=8,
 	               help='σ grid points per block (log-uniform)')
+	p.add_argument('--chain',      action='store_true',
+	               help='thread off-manifold trajectory across blocks '
+	                    '(cross-block inheritance); default self-seeds per block')
 	p.add_argument('--device',     default='cuda' if torch.cuda.is_available() else 'cpu')
 	return p.parse_args()
 
@@ -50,13 +60,23 @@ def get_batch(data_path, block_size, batch_size, device):
 
 
 @torch.no_grad()
-def probe_block(model, blk, z, pos, sigma_grid, device):
+def probe_block(model, blk, z, pos, sigma_grid, device, targets, zt_in=None):
 	"""
-	Returns (on_mse_list, off_mse_list) each of length len(sigma_grid).
+	Returns (on_mse_list, off_mse_list, on_ce_list, off_ce_list, zt_out).
 
 	on_mse_list[k]  = MSE of D(z + sigma_grid[k]*noise, sigma_grid[k]) to z
 	off_mse_list[k] = MSE of D(zt_traj_k, sigma_grid[k]) to z
-	                  where zt_traj_k is reached by Euler from sigma_grid[0]
+	                  where zt_traj_k is reached by Euler integration.
+	on_ce_list[k]   = CE of lm_head(D(on))  vs targets  (training CE path,
+	off_ce_list[k]  = CE of lm_head(D(off)) vs targets    model_dblock.py:200-208)
+	zt_out          = trajectory state at the block's low-σ exit (= next
+	                  block's σ_hi); feed back as zt_in to chain blocks.
+
+	zt_in is None  -> self-seed trajectory from z + sigma_grid[0]*noise
+	zt_in is state -> inherit upstream block's exit state (chained inference)
+
+	NOTE: only the LAST block's low-σ row is comparable to baseline/chained CE;
+	intermediate high-σ rows decode coarse estimates (model_dblock.py:227).
 	"""
 	B = model.num_dblocks
 	b, t, d = z.shape
@@ -75,12 +95,21 @@ def probe_block(model, blk, z, pos, sigma_grid, device):
 		x = model.transformer.ln_f(x)
 		return x * c_o[:, None, None] + zt * c_s[:, None, None]
 
+	def _ce(den):
+		logits = model.lm_head(den)
+		return F.cross_entropy(logits.view(-1, logits.size(-1)),
+		                       targets.view(-1)).item()
+
 	on_mse_list  = []
 	off_mse_list = []
+	on_ce_list   = []
+	off_ce_list  = []
 
-	# build trajectory: Euler from sigma_grid[0] (σ_hi) through the grid
-	noise   = torch.randn_like(z)
-	zt_traj = z + sigma_grid[0] * noise     # trajectory state, starts at σ_hi
+	# on-manifold comparison always uses fresh noise on true z
+	noise = torch.randn_like(z)
+	# off-manifold trajectory: inherit upstream exit state if chaining,
+	# else self-seed from z + σ_hi·noise (born on training distribution)
+	zt_traj = z + sigma_grid[0] * noise if zt_in is None else zt_in
 
 	for k, sig in enumerate(sigma_grid):
 		sig_t = sig.unsqueeze(0)
@@ -88,13 +117,13 @@ def probe_block(model, blk, z, pos, sigma_grid, device):
 		# (i) on-manifold: fresh z + σ·noise
 		zt_on = z + sig * noise             # same noise draw for fair comparison
 		den_on = _denoise(zt_on, sig_t)
-		on_mse = ((den_on - z) ** 2).mean().item()
-		on_mse_list.append(on_mse)
+		on_mse_list.append(((den_on - z) ** 2).mean().item())
+		on_ce_list.append(_ce(den_on))
 
 		# (ii) off-manifold: current trajectory state
 		den_off = _denoise(zt_traj, sig_t)
-		off_mse = ((den_off - z) ** 2).mean().item()
-		off_mse_list.append(off_mse)
+		off_mse_list.append(((den_off - z) ** 2).mean().item())
+		off_ce_list.append(_ce(den_off))
 
 		# advance trajectory by one Euler step (if not last)
 		if k < len(sigma_grid) - 1:
@@ -102,7 +131,7 @@ def probe_block(model, blk, z, pos, sigma_grid, device):
 			dt      = sigma_grid[k + 1] - sig
 			zt_traj = zt_traj + d1 * dt
 
-	return on_mse_list, off_mse_list
+	return on_mse_list, off_mse_list, on_ce_list, off_ce_list, zt_traj
 
 
 @torch.no_grad()
@@ -132,19 +161,30 @@ def main():
 	B          = model.num_dblocks
 	pos        = torch.arange(block_size, device=args.device)
 
-	print(f"checkpoint : {args.out_dir}  iter={ckpt['iter_num']}")
-	print(f"num_dblocks: {B}   n_layer={model_args['n_layer']}")
-	print(f"n_grid     : {args.n_grid} (log-uniform per block)")
-	print()
+	# collect output for both stdout and file
+	lines = []
+	def emit(s=''):
+		print(s)
+		lines.append(s)
+
+	mode = 'chained' if args.chain else 'unchained (self-seed per block)'
+	emit(f"checkpoint : {args.out_dir}  iter={ckpt['iter_num']}")
+	emit(f"num_dblocks: {B}   n_layer={model_args['n_layer']}")
+	emit(f"n_grid     : {args.n_grid} (log-uniform per block)")
+	emit(f"mode       : {mode}")
+	emit()
 
 	# accumulate over eval_iters batches
-	on_acc  = [[0.0] * args.n_grid for _ in range(B)]
-	off_acc = [[0.0] * args.n_grid for _ in range(B)]
+	on_acc      = [[0.0] * args.n_grid for _ in range(B)]
+	off_acc     = [[0.0] * args.n_grid for _ in range(B)]
+	on_ce_acc   = [[0.0] * args.n_grid for _ in range(B)]
+	off_ce_acc  = [[0.0] * args.n_grid for _ in range(B)]
 
 	for _ in range(args.eval_iters):
-		X, _ = get_batch(val_path, block_size, args.batch_size, args.device)
+		X, Y = get_batch(val_path, block_size, args.batch_size, args.device)
 		z = model.transformer.wte(X)      # [batch, t, d]
 
+		zt_in = None                       # block 0 always self-seeds
 		for blk in range(B):
 			# blk 0 = high-σ (coarse); reversed
 			actual = B - 1 - blk
@@ -153,10 +193,16 @@ def main():
 			sigma_grid = torch.linspace(math.log(s_hi), math.log(s_lo),
 			                            args.n_grid,
 			                            device=args.device).exp()
-			on_l, off_l = probe_block(model, blk, z, pos, sigma_grid, args.device)
+			on_l, off_l, on_ce_l, off_ce_l, zt_out = probe_block(
+			    model, blk, z, pos, sigma_grid, args.device, Y, zt_in)
 			for k in range(args.n_grid):
-				on_acc[blk][k]  += on_l[k]
-				off_acc[blk][k] += off_l[k]
+				on_acc[blk][k]     += on_l[k]
+				off_acc[blk][k]    += off_l[k]
+				on_ce_acc[blk][k]  += on_ce_l[k]
+				off_ce_acc[blk][k] += off_ce_l[k]
+			# chained: next block inherits this block's exit state;
+			# unchained: next block self-seeds from clean data
+			zt_in = zt_out if args.chain else None
 
 	n = args.eval_iters
 	for blk in range(B):
@@ -167,17 +213,30 @@ def main():
 		                            args.n_grid,
 		                            device=args.device).exp().tolist()
 
-		print(f"block {blk} (σ {s_hi:.4f}→{s_lo:.4f})")
-		print(f"  {'σ':>10}  {'on-mse':>10}  {'off-mse':>10}  {'ratio':>8}")
+		emit(f"block {blk} (σ {s_hi:.4f}→{s_lo:.4f})")
+		emit(f"  {'σ':>10}  {'on-mse':>10}  {'off-mse':>10}  {'ratio':>8}"
+		     f"  {'on-ce':>9}  {'off-ce':>9}")
 		for k in range(args.n_grid):
-			on_m  = on_acc[blk][k]  / n
-			off_m = off_acc[blk][k] / n
+			on_m  = on_acc[blk][k]     / n
+			off_m = off_acc[blk][k]    / n
+			on_c  = on_ce_acc[blk][k]  / n
+			off_c = off_ce_acc[blk][k] / n
 			ratio = off_m / on_m if on_m > 0 else float('inf')
-			print(f"  {sigma_grid[k]:10.4f}  {on_m:10.5f}  {off_m:10.5f}  {ratio:8.3f}")
-		print()
+			emit(f"  {sigma_grid[k]:10.4f}  {on_m:10.5f}  {off_m:10.5f}  {ratio:8.3f}"
+			     f"  {on_c:9.4f}  {off_c:9.4f}")
+		emit()
 
-	print("ratio >> 1 at low-σ end → denoiser off-manifold along trajectory")
-	print("ratio ≈ 1 throughout   → trajectory stays on training distribution")
+	emit("ratio >> 1 at low-σ end → denoiser off-manifold along trajectory")
+	emit("ratio ≈ 1 throughout   → trajectory stays on training distribution")
+	emit("CE: only LAST block low-σ row comparable to baseline/chained-eval CE")
+	emit("    (intermediate high-σ rows decode coarse estimates; nats, vocab-dependent)")
+
+	tag      = 'chain' if args.chain else 'nochain'
+	base     = os.path.basename(args.out_dir.rstrip('/'))
+	out_path = f"eval_offmanifold_{tag}_{base}.txt"
+	with open(out_path, 'w') as f:
+		f.write('\n'.join(lines) + '\n')
+	print(f"\nwrote {out_path}")
 
 
 if __name__ == '__main__':

@@ -340,22 +340,28 @@ class GPTDBlock(GPT):
 	                         n_steps: int = 64, solver: str = 'euler',
 	                         grid: str = 'global', from_noise: bool = True,
 	                         sigma_min=None, sigma_max=None):
-		"""Composed trajectory across ALL blocks — the FAITHFUL deployment sampler.
+		"""Composed trajectory across ALL blocks — TEACHER-FORCED composed sampler.
 
 		Walks the full descending σ schedule, switching blocks via _target_block
-		as σ descends, threading ODE state z across block boundaries. This is the
-		Gap-B measurement: what composition actually costs.
+		as σ descends, threading ODE state z across block boundaries.
+
+		NOT the free-running deployment sampler. The clean conditioning stream is
+		the GROUND-TRUTH tokens (teacher forcing), not the model's own previously
+		generated tokens. So this measures the composed-sampler likelihood given a
+		correct clean context — an honest, useful instrument for the composed
+		objective, but it does NOT expose error accumulation from the model
+		conditioning on its own (possibly wrong) generations. Free-running
+		generation is a separate path (see chained_eval.py notes).
 
 		CLEAN-CONDITIONING (Block Diffusion): the evolving noisy stream is denoised
-		conditioned on the FIXED clean stream = true tokens (teacher-forced clean
-		past, via the 2S mask in _denoise_chained). This is the AR likelihood under
-		the composed sampler — the property the old single-stream path lacked.
+		conditioned on the fixed clean stream via the 2S mask in _denoise_chained —
+		noisy reads clean PAST only. The AR property the old single-stream path lacked.
 
 		x0 = softmax(logits) @ wte.weight  (Sakana diffusion_step; weight-tied head).
 		Euler prob-flow ODE in embedding space; optional Heun corrector.
 
-		from_noise=True  : pure-noise init of the noisy stream (faithful deployment;
-		                   clean past still supplied as conditioning).
+		from_noise=True  : pure-noise init of the noisy stream (clean past still
+		                   supplied as teacher-forced conditioning).
 		from_noise=False : z_clean + σ_max·noise init (reconstruction framing).
 
 		Returns dict:

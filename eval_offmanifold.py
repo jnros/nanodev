@@ -1,5 +1,10 @@
 """Off-manifold probe: test whether dblock denoiser is valid along ODE trajectory.
 
+Clean-conditioned (matches the trained 2S architecture) and uses the Sakana ODE
+target x0 = softmax(logits) @ wte.weight throughout — the SAME x0 as
+forward_chained_eval, so the two instruments are cross-comparable. (Pre-concat this
+probe ran the old single-stream path with a raw-EDM x0; both were fixed together.)
+
 For each block, evaluates denoiser MSE at a σ grid under two input conditions:
   (i)  on-manifold:  zt = z + σ·noise   (training distribution)
   (ii) off-manifold: zt from Euler ODE trajectory integrated from σ_hi
@@ -64,11 +69,15 @@ def probe_block(model, blk, z, pos, sigma_grid, device, targets, zt_in=None):
 	"""
 	Returns (on_mse_list, off_mse_list, on_ce_list, off_ce_list, zt_out).
 
-	on_mse_list[k]  = MSE of D(z + sigma_grid[k]*noise, sigma_grid[k]) to z
-	off_mse_list[k] = MSE of D(zt_traj_k, sigma_grid[k]) to z
-	                  where zt_traj_k is reached by Euler integration.
-	on_ce_list[k]   = CE of lm_head(D(on))  vs targets  (training CE path,
-	off_ce_list[k]  = CE of lm_head(D(off)) vs targets    model_dblock.py:200-208)
+	Denoise is clean-conditioned (2S mask, true tokens as clean past) and the
+	ODE target is x0 = softmax(logits) @ wte.weight — SAME definition as
+	forward_chained_eval, so numbers are cross-comparable between the two.
+
+	on_mse_list[k]  = MSE of x0(z + sigma_grid[k]*noise, sigma_grid[k]) to z
+	off_mse_list[k] = MSE of x0(zt_traj_k, sigma_grid[k]) to z
+	                  where zt_traj_k is reached by Euler integration on x0.
+	on_ce_list[k]   = CE of lm_head(denoise(on))  vs targets
+	off_ce_list[k]  = CE of lm_head(denoise(off)) vs targets
 	zt_out          = trajectory state at the block's low-σ exit (= next
 	                  block's σ_hi); feed back as zt_in to chain blocks.
 
@@ -80,8 +89,17 @@ def probe_block(model, blk, z, pos, sigma_grid, device, targets, zt_in=None):
 	"""
 	B = model.num_dblocks
 	b, t, d = z.shape
+	wte_w = model.transformer.wte.weight                 # tied head
 
 	def _denoise(zt, sigma_scalar):
+		"""Clean-conditioned forced-block denoise; returns logits [b,t,V].
+
+		Uses the SAME 2S clean-conditioning path as the trained model
+		(model_dblock.py forward / _denoise_chained): clean stream = z (true
+		tokens) at the σ_min sentinel, noisy stream = zt, noisy reads clean past
+		via _clean_noisy_mask. Block is FORCED to `blk` (per-block probe), unlike
+		_denoise_chained which picks the block from σ.
+		"""
 		sv = sigma_scalar.expand(b)
 		s2  = sv ** 2
 		sd2 = model.sigma_data ** 2
@@ -89,14 +107,33 @@ def probe_block(model, blk, z, pos, sigma_grid, device, targets, zt_in=None):
 		c_o = sv * model.sigma_data / (s2 + sd2).sqrt()
 		c_i = 1.0 / (s2 + sd2).sqrt()
 		c_n = 0.25 * sv.log()
-		x = zt * c_i[:, None, None] + model.transformer.wpe(pos)
-		for i in model.layer_assignment[blk]:
-			x = model.transformer.h[i](x, c_n)
-		x = model.transformer.ln_f(x)
-		return x * c_o[:, None, None] + zt * c_s[:, None, None]
 
-	def _ce(den):
-		logits = model.lm_head(den)
+		sigma_min = model.block_sigmas[0]
+		c_i_clean = 1.0 / math.sqrt(sigma_min ** 2 + sd2)
+		c_n_clean = 0.25 * math.log(sigma_min)
+
+		wpe = model.transformer.wpe(pos)
+		x_clean = z  * c_i_clean        + wpe
+		x_noisy = zt * c_i[:, None, None] + wpe
+		x = torch.cat([x_clean, x_noisy], dim=1)
+		cn = torch.cat([
+		        torch.full((b, t), c_n_clean, device=zt.device, dtype=c_n.dtype),
+		        c_n[:, None].expand(b, t),
+		     ], dim=1)
+		mask = model._clean_noisy_mask(t, zt.device)
+		for i in model.layer_assignment[blk]:
+			x = model.transformer.h[i](x, cn, attn_mask=mask)
+		x = model.transformer.ln_f(x)
+		x_noisy_out = x[:, t:, :]
+		den = x_noisy_out * c_o[:, None, None] + zt * c_s[:, None, None]
+		return model.lm_head(den)
+
+	def _x0(logits):
+		# ODE target = Sakana softmax@wte (matches forward_chained_eval). NOT the
+		# raw EDM reconstruction — keep one x0 definition across both instruments.
+		return F.softmax(logits, dim=-1) @ wte_w
+
+	def _ce(logits):
 		return F.cross_entropy(logits.view(-1, logits.size(-1)),
 		                       targets.view(-1)).item()
 
@@ -116,18 +153,20 @@ def probe_block(model, blk, z, pos, sigma_grid, device, targets, zt_in=None):
 
 		# (i) on-manifold: fresh z + σ·noise
 		zt_on = z + sig * noise             # same noise draw for fair comparison
-		den_on = _denoise(zt_on, sig_t)
-		on_mse_list.append(((den_on - z) ** 2).mean().item())
-		on_ce_list.append(_ce(den_on))
+		logits_on = _denoise(zt_on, sig_t)
+		x0_on = _x0(logits_on)
+		on_mse_list.append(((x0_on - z) ** 2).mean().item())
+		on_ce_list.append(_ce(logits_on))
 
 		# (ii) off-manifold: current trajectory state
-		den_off = _denoise(zt_traj, sig_t)
-		off_mse_list.append(((den_off - z) ** 2).mean().item())
-		off_ce_list.append(_ce(den_off))
+		logits_off = _denoise(zt_traj, sig_t)
+		x0_off = _x0(logits_off)
+		off_mse_list.append(((x0_off - z) ** 2).mean().item())
+		off_ce_list.append(_ce(logits_off))
 
-		# advance trajectory by one Euler step (if not last)
+		# advance trajectory by one Euler step (if not last); x0 = softmax@wte
 		if k < len(sigma_grid) - 1:
-			d1      = (zt_traj - den_off) / sig
+			d1      = (zt_traj - x0_off) / sig
 			dt      = sigma_grid[k + 1] - sig
 			zt_traj = zt_traj + d1 * dt
 

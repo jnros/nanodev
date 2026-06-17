@@ -54,6 +54,8 @@ K=∞ diverges. Best CE of 3.25 at iteration 2000, climbing to ~8 by the end. Th
 
 The open question is where the knee is. K=1000 is fine. K=∞ is not. Somewhere between them is a threshold worth finding.
 
+Note: absolute CE values here are from pre-concat model and expected to move.
+
 ---
 
 If the flat K=1–1000 result holds at larger scale — bigger models, more blocks, slower interconnect — the mandatory-fabric assumption behind current AI concentration starts to bend. That's a big if. It's also a smaller if than it was before this experiment.

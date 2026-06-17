@@ -11,11 +11,13 @@ import matplotlib.pyplot as plt
 
 DEPTHS = [6, 8, 10, 12]
 
+# baselines are architecture-independent → reuse pre-concat runs.
+# dblock dirs are the clean-noisy-concat sweep at repo root.
 BASELINE_DIRS = {
-    6:  'out-enwik8-baseline-L6',
-    8:  'out-enwik8-baseline-L8',
-    10: 'out-enwik8-baseline-L10',
-    12: 'out-enwik8-baseline-L12',
+    6:  'pre-concat/out-enwik8-baseline-L6',
+    8:  'pre-concat/out-enwik8-baseline-L8',
+    10: 'pre-concat/out-enwik8-baseline-L10',
+    12: 'pre-concat/out-enwik8-baseline-L12',
 }
 
 DBLOCK_DIRS = {
@@ -27,10 +29,12 @@ DBLOCK_DIRS = {
 
 
 def _final_val_ce(out_dir):
+    # BEST val CE (min over the curve) — matches the reported table; the runs
+    # are flat near the end so best ≈ final, but best is the headline metric.
     path = os.path.join(out_dir, 'loss_curves.json')
     with open(path) as f:
         curves = json.load(f)
-    return curves[-1].get('val_ce', curves[-1]['val'])
+    return min(c.get('val_ce', c['val']) for c in curves)
 
 
 def _peak_vram(out_dir, kind):
@@ -66,7 +70,7 @@ def main():
         return
 
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-    fig.suptitle('enwik8 char-level depth sweep', fontsize=12)
+    fig.suptitle('enwik8 char-level depth sweep (dblock = clean-noisy-concat)', fontsize=12)
 
     ax = axes[0]
     ax.plot(depths, base_ce, 'o-', label='baseline')

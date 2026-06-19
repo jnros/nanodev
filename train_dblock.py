@@ -57,6 +57,7 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True
 # DBlock-specific
 num_dblocks = 3
+gamma = 0.0  # Sakana overlap factor (0.1 for text); 0 = disjoint bands
 ema_decay = 0.999
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items()
@@ -131,7 +132,7 @@ if init_from == 'scratch':
     print("Initializing a new model from scratch")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
-    model   = GPTDBlock(gptconf, num_dblocks=num_dblocks)
+    model   = GPTDBlock(gptconf, num_dblocks=num_dblocks, gamma=gamma)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     ckpt_path  = os.path.join(out_dir, 'ckpt.pt')
@@ -140,7 +141,7 @@ elif init_from == 'resume':
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
     gptconf = GPTConfig(**model_args)
-    model   = GPTDBlock(gptconf, num_dblocks=num_dblocks)
+    model   = GPTDBlock(gptconf, num_dblocks=num_dblocks, gamma=gamma)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
     for k, v in list(state_dict.items()):

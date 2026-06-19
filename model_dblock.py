@@ -110,12 +110,17 @@ class GPTDBlock(GPT):
 	"""
 
 	def __init__(self, config: GPTConfig, num_dblocks: int = 3,
-	             sigma_data: float = 0.5):
+	             sigma_data: float = 0.5, gamma: float = 0.0):
 		assert config.n_layer % num_dblocks == 0, \
 			f"n_layer {config.n_layer} not divisible by num_dblocks {num_dblocks}"
 		super().__init__(config)
 		self.num_dblocks = num_dblocks
 		self.sigma_data  = sigma_data
+		# Sakana overlap factor (arxiv 2506.14202): γ>0 extends each block's
+		# training σ-band in log-σ space to smooth boundary transitions.
+		# 0.05 default, 0.1 for text. TRAINING-sampling only — inference routing
+		# (_target_block) still uses the original disjoint boundaries.
+		self.gamma       = gamma
 
 		# DBLOCK 3/6: swap every standard Block for a DBlock (AdaLN variant).
 		self.transformer.h = nn.ModuleList(
@@ -144,6 +149,14 @@ class GPTDBlock(GPT):
 		b     = random.randint(0, self.num_dblocks - 1)
 		s_lo  = self.block_sigmas[b]
 		s_hi  = self.block_sigmas[b + 1]
+		if self.gamma > 0.0:
+			# extend band in log-σ, clamp to global [σ_min, σ_max].
+			ln_lo, ln_hi = math.log(s_lo), math.log(s_hi)
+			rng   = ln_hi - ln_lo
+			s_lo  = max(math.exp(ln_lo - self.gamma * rng),
+			            self.block_sigmas[0])
+			s_hi  = min(math.exp(ln_hi + self.gamma * rng),
+			            self.block_sigmas[-1])
 		pm, ps = -1.2, 1.2
 		c_lo  = _norm_cdf((math.log(s_lo) - pm) / ps)
 		c_hi  = _norm_cdf((math.log(s_hi) - pm) / ps)
@@ -259,6 +272,107 @@ class GPTDBlock(GPT):
 			edm_loss = (per_seq * w).mean()
 
 		return logits, edm_loss, ce_loss
+
+	# --- interior conditioning (2a/2b): block-local training on off-shell inputs ---
+
+	def _forward_block_core(self, idx, zt, targets, blk, sigma_label):
+		"""Block-local forward given an arbitrary noisy state zt at sigma_label.
+
+		The shared core for both interventions: EDM-precondition zt at the LABEL
+		σ, run the 2S clean-conditioned block, supervise the KNOWN clean tokens
+		via EDM-weighted CE. No score/velocity target — the "inward target" is
+		just `targets`. Mirrors forward() (model_dblock.py:215-261).
+
+		zt          [b,t,d]: the (possibly off-shell) noisy embedding to denoise.
+		sigma_label [b]:     σ the block is told it sees (EDM precond + loss weight).
+		blk:                 forced block index (no _target_block / random sampling).
+		"""
+		device = idx.device
+		b, t   = idx.size()
+		sl  = sigma_label
+		sd2 = self.sigma_data ** 2
+		s2  = sl ** 2
+		c_skip  = sd2 / (s2 + sd2)
+		c_out   = sl * self.sigma_data / (s2 + sd2).sqrt()
+		c_in    = 1.0 / (s2 + sd2).sqrt()
+		c_noise = 0.25 * sl.log()
+
+		sigma_min     = self.block_sigmas[0]
+		c_in_clean    = 1.0 / math.sqrt(sigma_min ** 2 + sd2)
+		c_noise_clean = 0.25 * math.log(sigma_min)
+
+		z   = self.transformer.wte(idx)
+		pos = torch.arange(t, device=device)
+		wpe = self.transformer.wpe(pos)
+		x_clean = z  * c_in_clean        + wpe
+		x_noisy = zt * c_in[:, None, None] + wpe
+		x = self.transformer.drop(torch.cat([x_clean, x_noisy], dim=1))
+
+		cn = torch.cat([
+		        torch.full((b, t), c_noise_clean, device=device,
+		                   dtype=c_noise.dtype),
+		        c_noise[:, None].expand(b, t),
+		     ], dim=1)
+		mask = self._clean_noisy_mask(t, device)
+
+		for i in self.layer_assignment[blk]:
+			x = self.transformer.h[i](x, cn, attn_mask=mask)
+		x = self.transformer.ln_f(x)
+
+		x_noisy_out = x[:, t:, :]
+		denoised = (x_noisy_out * c_out[:, None, None]
+		            + zt        * c_skip[:, None, None])
+		logits = self.lm_head(denoised)
+
+		per_tok  = F.cross_entropy(
+		    logits.view(-1, logits.size(-1)),
+		    targets.view(-1), reduction='none')
+		ce_loss  = per_tok.mean()
+		w        = self._edm_weights(sl)
+		per_seq  = per_tok.view(b, t).mean(-1)
+		edm_loss = (per_seq * w).mean()
+		return logits, edm_loss, ce_loss
+
+	def forward_aug(self, idx, targets, blk, sigma_noise, sigma_label):
+		"""Intervention 2a: σ-mismatch off-shell input.
+
+		zt = z + σ_noise·eps but labelled σ_label. On-shell when equal; off-shell
+		(isotropic, over-noised) when σ_noise > σ_label. RESULT: this axis does
+		NOT cover the trajectory's directional self-drift (see eval_block2_control
+		— ~0.05 nat effect even at large mismatch). Kept for the record; use 2b.
+		"""
+		z  = self.transformer.wte(idx)
+		zt = z + sigma_noise[:, None, None] * torch.randn_like(z)
+		return self._forward_block_core(idx, zt, targets, blk, sigma_label)
+
+	@torch.no_grad()
+	def block_rollout(self, idx, blk, n_steps, s_lo, s_hi):
+		"""Intervention 2b: generate block `blk`'s OWN realized drift states.
+
+		Run the block's single-band prob-flow ODE (clean-conditioned, Euler) from
+		σ=s_hi down to s_lo and collect the intermediate noisy states it actually
+		visits. These carry the DIRECTIONAL error 2a's isotropic σ-mismatch can't
+		reproduce. Uses current weights → online self-rollout (DAgger-style).
+
+		Returns list of (zt_detached [b,t,d], sigma_scalar) over the n_steps grid.
+		"""
+		device  = idx.device
+		pos     = torch.arange(idx.size(1), device=device)
+		z_clean = self.transformer.wte(idx)
+		wte_w   = self.transformer.wte.weight
+		sigmas  = torch.linspace(math.log(s_hi), math.log(s_lo),
+		                         n_steps, device=device).exp()
+
+		zt     = z_clean + sigmas[0] * torch.randn_like(z_clean)
+		states = [(zt.detach().clone(), sigmas[0].clone())]
+		for k in range(n_steps - 1):
+			s_k = sigmas[k]
+			logits, _ = self._denoise_chained(z_clean, zt, s_k, pos)
+			x0 = F.softmax(logits, dim=-1) @ wte_w
+			d  = (zt - x0) / s_k
+			zt = zt + d * (sigmas[k + 1] - s_k)
+			states.append((zt.detach().clone(), sigmas[k + 1].clone()))
+		return states
 
 	# --- chained (composed) inference: the deployment sampler ---
 

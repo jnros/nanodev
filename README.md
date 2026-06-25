@@ -33,12 +33,4 @@ The amortized network traffic at K=1000 is 9.71 KB per step vs 66.5 MB for stand
 
 We swept K ∈ {1, 10, 100, 1000, ∞} on enwik8 L=6, 60k iterations. K=1 through K=1000 land within 0.02 CE of each other — the curve is essentially flat. Sync less, pay nothing.
 
-![interconnect summary](interconnect_summary.png)
-
 K=∞ diverges. Best CE of 3.25 at iteration 2000, climbing to ~8 by the end. Shared interface is necessary. Carries consensus signal that keeps seperate denoising experts pointing at the same language distribution. Without it, they drift apart.
-
-The open question is where the knee is. K=1000 is fine. K=∞ is not. Somewhere between them is a threshold worth finding.
-
----
-
-If the flat K=1–1000 result holds at larger scale — bigger models, more blocks, slower interconnect — the mandatory-fabric assumption behind current AI concentration starts to bend. That's a big if. It's also a smaller if than it was before this experiment.
